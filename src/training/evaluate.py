@@ -1,71 +1,63 @@
 """
-evaluation — runs a model on a dataloader, returns MAE and per-sample records.
+evaluation function used by training and by the bias audit (Phase 5).
 
-used by:
-    - training loop, to compute validation MAE every epoch
-    - bias audit (Phase 5), to slice predictions by gender/ethnicity/age bucket
+returns val loss + val MAE. MAE is the headline metric for age
+estimation — interpretable as "average error in years".
+
+Phase 4 change: decodes ordinal logits to predicted age before computing
+MAE, so train-time metric and inference-time output line up exactly.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
-
-@dataclass
-class EvalResult:
-    mae: float
-    rmse: float
-    num_samples: int
-    # per-sample arrays — used by bias audit, kept on CPU
-    preds: torch.Tensor      # shape [N], float
-    targets: torch.Tensor    # shape [N], float
-    genders: torch.Tensor    # shape [N], long
-    ethnicities: torch.Tensor  # shape [N], long
+from src.models.ordinal_loss import ordinal_logits_to_age
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> EvalResult:
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    loss_fn: nn.Module,
+    device: torch.device,
+) -> dict:
     """
-    run model on every batch in `loader`, no gradients.
-    returns aggregate MAE/RMSE plus per-sample arrays for downstream slicing.
+    forward pass over the eval loader. no gradients (no_grad decorator).
+
+    returns:
+        val_loss — average ordinal loss over the eval set
+        val_mae  — mean absolute error in years between decoded ages
+                   and true ages
     """
-    model.eval()  # turn off dropout, freeze batchnorm running stats
+    model.eval()
+    running_loss = 0.0
+    running_mae = 0.0
+    seen = 0
 
-    all_preds: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
-    all_genders: list[torch.Tensor] = []
-    all_ethnicities: list[torch.Tensor] = []
+    for images, ages in loader:
+        images = images.to(device, non_blocking=True)
+        ages = ages.to(device, non_blocking=True)
 
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        ages = batch["age"].float().to(device, non_blocking=True)
+        # forward only — no backprop, no optimizer step
+        logits = model(images)
 
-        preds = model(images)
+        # loss is computed on the raw logits (BCEWithLogitsLoss handles sigmoid)
+        loss = loss_fn(logits, ages)
 
-        # pull tensors back to CPU before the next batch — GPU memory stays bounded
-        all_preds.append(preds.detach().cpu())
-        all_targets.append(ages.detach().cpu())
-        all_genders.append(batch["gender"].cpu())
-        all_ethnicities.append(batch["ethnicity"].cpu())
+        # MAE is computed on the decoded prediction so the metric reflects
+        # the actual age the model would output at inference
+        pred_ages = ordinal_logits_to_age(logits)
+        abs_err = (pred_ages - ages.float()).abs().sum().item()
 
-    preds = torch.cat(all_preds)
-    targets = torch.cat(all_targets)
-    genders = torch.cat(all_genders)
-    ethnicities = torch.cat(all_ethnicities)
+        bs = images.size(0)
+        running_loss += loss.item() * bs
+        running_mae += abs_err
+        seen += bs
 
-    abs_err = (preds - targets).abs()
-    mae = abs_err.mean().item()
-    rmse = ((preds - targets) ** 2).mean().sqrt().item()
-
-    return EvalResult(
-        mae=mae,
-        rmse=rmse,
-        num_samples=len(targets),
-        preds=preds,
-        targets=targets,
-        genders=genders,
-        ethnicities=ethnicities,
-    )
+    return {
+        "val_loss": running_loss / max(seen, 1),
+        "val_mae": running_mae / max(seen, 1),
+    }

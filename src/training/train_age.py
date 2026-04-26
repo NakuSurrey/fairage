@@ -1,15 +1,15 @@
 """
-training script for the age estimator.
+training loop for the ordinal age estimator.
 
-invoked by SLURM via slurm/train_age.sh on Surrey HPC.
-also runnable on a laptop with --epochs 1 for a smoke test.
+Phase 3 used MSE loss directly on a single regression output.
+Phase 4 uses OrdinalRegressionLoss on 100 binary thresholds, and
+decodes logits -> predicted age for the MAE metric.
 
-what it does:
-    1. load UTKFace, split 80/10/10 into train/val/test (seeded for reproducibility)
-    2. build DataLoaders with the train and inference transforms
-    3. train ResNet-50 + regression head, log every epoch to Weights & Biases
-    4. save the best checkpoint by validation MAE
-    5. run final evaluation on the test set, log MAE and RMSE
+flow per epoch:
+    1. train pass — forward, compute ordinal loss, backprop, step
+    2. eval pass  — forward, decode logits to ages, compute MAE
+    3. log to W&B if a key is set, else log to local JSON
+    4. save best checkpoint by val MAE
 """
 
 from __future__ import annotations
@@ -17,279 +17,218 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-import sys
-import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
-
-# repo root on sys.path so `src.*` imports work when SLURM runs us
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.config import (
     BATCH_SIZE,
-    CHECKPOINTS_DIR,
-    EARLY_STOPPING_PATIENCE,
+    DEVICE,
     LEARNING_RATE,
     NUM_EPOCHS,
     NUM_WORKERS,
     SEED,
     WEIGHT_DECAY,
 )
-from src.data.transforms import get_inference_transform, get_train_transform
 from src.data.utkface_dataset import UTKFaceDataset
-from src.models.age_estimator import AgeEstimator, count_parameters
-from src.training.evaluate import evaluate
+from src.data.transforms import build_train_transforms, build_eval_transforms
+from src.models.age_estimator import AgeEstimator
+from src.models.ordinal_loss import OrdinalRegressionLoss, ordinal_logits_to_age
+from src.training.evaluate import evaluate_model
 
+# W&B is optional — gracefully degrade to local JSON logs if no key
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-# ---------- reproducibility ----------
 
 def set_seed(seed: int) -> None:
-    """seed every RNG so train/val/test split is the same on every run."""
+    """make the run reproducible — seed every random source we touch."""
+    import random
+    import numpy as np
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-
-# ---------- data splitting ----------
-
-def split_dataset(full_ds: UTKFaceDataset, seed: int) -> tuple[Subset, Subset, Subset]:
-    """
-    80/10/10 train/val/test split.
-    using indices into the same dataset object — saves memory vs three full datasets.
-    """
-    n = len(full_ds)
-    indices = list(range(n))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-
-    n_train = int(0.8 * n)
-    n_val = int(0.1 * n)
-
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train : n_train + n_val]
-    test_idx = indices[n_train + n_val :]
-
-    return (Subset(full_ds, train_idx),
-            Subset(full_ds, val_idx),
-            Subset(full_ds, test_idx))
-
-
-# ---------- training loop ----------
 
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
+    loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
     device: torch.device,
-    epoch: int,
-) -> dict[str, float]:
-    """one full pass over the training set. returns mean loss and MAE."""
-    model.train()  # enable dropout, batchnorm uses batch stats
+) -> dict:
+    """
+    one full pass over the training set.
 
-    total_loss = 0.0
-    total_abs_err = 0.0
-    total_samples = 0
+    returns a dict with the running averages — train loss and train MAE
+    (decoded from logits, gives a quick sanity check vs the val MAE).
+    """
+    model.train()
+    running_loss = 0.0
+    running_mae = 0.0
+    seen = 0
 
-    pbar = tqdm(loader, desc=f"epoch {epoch} train", leave=False)
-    for batch in pbar:
-        images = batch["image"].to(device, non_blocking=True)
-        ages = batch["age"].float().to(device, non_blocking=True)
+    for images, ages in loader:
+        images = images.to(device, non_blocking=True)
+        ages = ages.to(device, non_blocking=True)
 
-        # forward pass
-        preds = model(images)
-        loss = criterion(preds, ages)
-
-        # backward pass
+        # forward -> loss -> backprop -> step
+        # zero_grad first so old gradients from the last batch don't pile up
         optimizer.zero_grad()
+        logits = model(images)
+        loss = loss_fn(logits, ages)
         loss.backward()
         optimizer.step()
 
-        # running stats
+        # track running stats — multiply by batch size so the final divide
+        # by `seen` gives a true per-sample average even on uneven last batch
         bs = images.size(0)
-        total_loss += loss.item() * bs
-        total_abs_err += (preds - ages).abs().sum().item()
-        total_samples += bs
+        running_loss += loss.item() * bs
 
-        pbar.set_postfix(loss=f"{loss.item():.3f}")
+        # decode for MAE — same code path the eval uses
+        with torch.no_grad():
+            pred_ages = ordinal_logits_to_age(logits)
+            running_mae += (pred_ages - ages.float()).abs().sum().item()
+
+        seen += bs
 
     return {
-        "loss": total_loss / total_samples,
-        "mae": total_abs_err / total_samples,
+        "train_loss": running_loss / max(seen, 1),
+        "train_mae": running_mae / max(seen, 1),
     }
 
 
-# ---------- main ----------
-
-def main():
+def main() -> None:
+    # CLI args — keep defaults coming from config.py, override per run
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS,
-                        help="override config NUM_EPOCHS — useful for laptop smoke tests")
+    parser.add_argument("--data-dir", type=str, required=True,
+                        help="path to UTKFace folder")
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
-    parser.add_argument("--no-wandb", action="store_true",
-                        help="skip Weights & Biases logging — for offline / laptop runs")
-    parser.add_argument("--checkpoint-name", type=str, default="age_best.pt")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--output-dir", type=str, default="artifacts")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--no-pretrained", action="store_true",
+                        help="disable ImageNet weights — used by smoke tests")
+    parser.add_argument("--wandb-project", type=str, default="fairage")
     args = parser.parse_args()
 
-    set_seed(SEED)
+    # reproducibility — set seed before any random op
+    set_seed(args.seed)
 
-    # ---------- device ----------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[setup] device = {device}")
-    if device.type == "cuda":
-        print(f"[setup] gpu = {torch.cuda.get_device_name(0)}")
+    # set up output directory for checkpoints + local JSON log
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- W&B (optional) ----------
-    wandb_run = None
-    if not args.no_wandb:
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=os.environ.get("WANDB_PROJECT", "fairage"),
-                entity=os.environ.get("WANDB_ENTITY"),
-                config={
-                    "epochs": args.epochs,
-                    "batch_size": args.batch_size,
-                    "lr": args.lr,
-                    "weight_decay": WEIGHT_DECAY,
-                    "model": "resnet50_regression_head",
-                    "phase": "3_baseline",
-                },
-            )
-        except Exception as exc:
-            print(f"[wandb] init failed, continuing without logging: {exc}")
-            wandb_run = None
+    # device — GPU if visible, else CPU. SLURM job gets GPU, local tests get CPU.
+    device = torch.device(DEVICE)
 
-    # ---------- data ----------
-    print("[data] loading UTKFace…")
-    base_ds = UTKFaceDataset(transform=None)
-    print(f"[data] {len(base_ds):,} valid samples ({base_ds.skipped_count} skipped)")
+    # datasets + loaders. UTKFaceDataset returns (image_tensor, age_int).
+    # train transforms add augmentation, eval transforms only resize+normalise.
+    train_ds = UTKFaceDataset(
+        root=args.data_dir,
+        split="train",
+        transform=build_train_transforms(),
+    )
+    val_ds = UTKFaceDataset(
+        root=args.data_dir,
+        split="val",
+        transform=build_eval_transforms(),
+    )
 
-    train_subset, val_subset, test_subset = split_dataset(base_ds, SEED)
-
-    # apply the right transform to each split — train gets augmentation, val/test do not
-    # Subset wraps the same base_ds, so swapping transforms via attribute works
-    train_ds = UTKFaceDataset(transform=get_train_transform())
-    eval_ds = UTKFaceDataset(transform=get_inference_transform())
-
-    # rebuild Subsets against the transformed datasets using the same indices
     train_loader = DataLoader(
-        Subset(train_ds, train_subset.indices),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=(device.type == "cuda"),
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
-        Subset(eval_ds, val_subset.indices),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=(device.type == "cuda"),
-    )
-    test_loader = DataLoader(
-        Subset(eval_ds, test_subset.indices),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=(device.type == "cuda"),
-    )
-    print(f"[data] train={len(train_loader.dataset)} val={len(val_loader.dataset)} test={len(test_loader.dataset)}")
-
-    # ---------- model ----------
-    model = AgeEstimator(pretrained=True).to(device)
-    pc = count_parameters(model)
-    print(f"[model] params total={pc['total']:,} trainable={pc['trainable']:,}")
-
-    # ---------- loss + optimizer ----------
-    # plain MSE for the baseline — Phase 4 swaps in ordinal MAE+MSE loss
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=WEIGHT_DECAY,
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
 
-    # ---------- training ----------
-    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    ckpt_path = CHECKPOINTS_DIR / args.checkpoint_name
+    # model + loss + optimizer + scheduler
+    model = AgeEstimator(pretrained=not args.no_pretrained).to(device)
+    loss_fn = OrdinalRegressionLoss().to(device)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_val_mae = float("inf")
-    epochs_no_improve = 0
-    history: list[dict] = []
+    # W&B init — optional. if no key in env, fall back to local JSON.
+    use_wandb = WANDB_AVAILABLE and os.environ.get("WANDB_API_KEY")
+    if use_wandb:
+        wandb.init(project=args.wandb_project, config=vars(args))
+
+    # training loop — track best val MAE across epochs to decide checkpoints
+    best_mae = float("inf")
+    history = []
 
     for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
-        train_stats = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
-        val_result = evaluate(model, val_loader, device)
-        epoch_secs = time.time() - t0
+        train_stats = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
+        val_stats = evaluate_model(model, val_loader, loss_fn, device)
+        scheduler.step()
 
-        log = {
+        # combine stats for logging — flat dict makes W&B charts simple
+        epoch_stats = {
             "epoch": epoch,
-            "train/loss": train_stats["loss"],
-            "train/mae": train_stats["mae"],
-            "val/mae": val_result.mae,
-            "val/rmse": val_result.rmse,
-            "epoch_secs": epoch_secs,
+            "lr": optimizer.param_groups[0]["lr"],
+            **train_stats,
+            **val_stats,
         }
-        history.append(log)
-        print(
-            f"[epoch {epoch:02d}/{args.epochs}] "
-            f"train_loss={log['train/loss']:.3f} train_mae={log['train/mae']:.2f} "
-            f"val_mae={log['val/mae']:.2f} val_rmse={log['val/rmse']:.2f} "
-            f"({epoch_secs:.1f}s)"
-        )
-        if wandb_run is not None:
-            wandb_run.log(log)
+        history.append(epoch_stats)
+        print(f"[epoch {epoch}/{args.epochs}] {epoch_stats}")
 
-        # early stopping + best checkpoint by validation MAE
-        if val_result.mae < best_val_mae:
-            best_val_mae = val_result.mae
-            epochs_no_improve = 0
+        if use_wandb:
+            wandb.log(epoch_stats)
+
+        # save best checkpoint by val MAE — overwrites previous best
+        if val_stats["val_mae"] < best_mae:
+            best_mae = val_stats["val_mae"]
+            ckpt_path = output_dir / "age_model_best.pt"
             torch.save({
-                "model_state_dict": model.state_dict(),
+                "model_state": model.state_dict(),
                 "epoch": epoch,
-                "val_mae": val_result.mae,
-                "val_rmse": val_result.rmse,
-                "config": {
-                    "lr": args.lr,
-                    "batch_size": args.batch_size,
-                    "weight_decay": WEIGHT_DECAY,
-                },
+                "val_mae": best_mae,
+                "args": vars(args),
             }, ckpt_path)
-            print(f"  -> new best, saved to {ckpt_path}")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
-                print(f"[early-stop] no improvement for {EARLY_STOPPING_PATIENCE} epochs — stopping")
-                break
 
-    # ---------- final test evaluation ----------
-    print(f"[test] loading best checkpoint from {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(state["model_state_dict"])
-    test_result = evaluate(model, test_loader, device)
-    print(f"[test] mae={test_result.mae:.2f} rmse={test_result.rmse:.2f} n={test_result.num_samples}")
+    # always save the final epoch too — useful for resuming and for diffs
+    final_path = output_dir / "age_model_final.pt"
+    torch.save({
+        "model_state": model.state_dict(),
+        "epoch": args.epochs,
+        "val_mae": history[-1]["val_mae"],
+        "args": vars(args),
+    }, final_path)
 
-    if wandb_run is not None:
-        wandb_run.summary["test/mae"] = test_result.mae
-        wandb_run.summary["test/rmse"] = test_result.rmse
-        wandb_run.finish()
-
-    # write a small json next to the checkpoint — survives wandb being offline
-    summary_path = CHECKPOINTS_DIR / args.checkpoint_name.replace(".pt", "_summary.json")
-    with open(summary_path, "w") as f:
+    # local JSON log — written every run, regardless of W&B status
+    log_path = output_dir / "training_history.json"
+    with log_path.open("w", encoding="utf-8") as f:
         json.dump({
-            "best_val_mae": best_val_mae,
-            "test_mae": test_result.mae,
-            "test_rmse": test_result.rmse,
-            "epochs_run": len(history),
+            "config": vars(args),
+            "best_val_mae": best_mae,
             "history": history,
         }, f, indent=2)
-    print(f"[done] summary written to {summary_path}")
+
+    if use_wandb:
+        wandb.finish()
+
+    print(f"done — best val MAE {best_mae:.3f} years, history saved to {log_path}")
 
 
 if __name__ == "__main__":

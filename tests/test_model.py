@@ -1,55 +1,79 @@
 """
-unit tests for src/models/age_estimator.py
-no real data needed — runs on dummy tensors, fast.
+unit tests for AgeEstimator.
+
+Phase 4: model now outputs (B, NUM_THRESHOLDS) logits instead of a single
+float. tests updated to match. predict_age helper is also covered.
+
+these run on CPU with pretrained=False so no model weights are downloaded
+during the test run.
 """
 
-import torch
+from __future__ import annotations
 
-from src.models.age_estimator import AgeEstimator, count_parameters
+import torch
+import pytest
+
+from src.models.age_estimator import AgeEstimator
+from src.models.ordinal_loss import NUM_THRESHOLDS
 
 
 class TestAgeEstimator:
-    def test_forward_pass_shape(self):
-        # build with pretrained=False to skip the imagenet weights download in CI
+    """end-to-end checks that the model wiring is correct."""
+
+    def test_output_shape(self):
+        # forward returns logits, one per threshold per image
         model = AgeEstimator(pretrained=False)
-        model.eval()
-
-        # batch of 4 RGB 224x224 images — matches IMAGE_SIZE in config
-        x = torch.randn(4, 3, 224, 224)
-        with torch.no_grad():
-            out = model(x)
-
-        # one float per image — last dim squeezed away by forward()
-        assert out.shape == (4,)
-        assert out.dtype == torch.float32
-
-    def test_single_image_works(self):
-        # batch size 1 — common path in the API
-        model = AgeEstimator(pretrained=False)
-        model.eval()
-        x = torch.randn(1, 3, 224, 224)
-        with torch.no_grad():
-            out = model(x)
-        assert out.shape == (1,)
-
-    def test_param_count_is_reasonable(self):
-        # ResNet-50 = ~25M params, head adds a tiny amount
-        model = AgeEstimator(pretrained=False)
-        counts = count_parameters(model)
-        assert 20_000_000 < counts["total"] < 30_000_000
-        # all params trainable by default
-        assert counts["trainable"] == counts["total"]
-
-    def test_train_mode_uses_dropout(self):
-        # in train mode, two forward passes on the same input give different outputs
-        # because dropout drops different units each time
-        model = AgeEstimator(pretrained=False, dropout=0.5)
-        model.train()
         x = torch.randn(2, 3, 224, 224)
-        torch.manual_seed(1)
-        out1 = model(x)
-        torch.manual_seed(2)
-        out2 = model(x)
-        # not strictly guaranteed, but with dropout 0.5 the chance of identical
-        # outputs across two seeds is effectively zero
-        assert not torch.allclose(out1, out2)
+        out = model(x)
+        assert out.shape == (2, NUM_THRESHOLDS)
+
+    def test_output_is_finite(self):
+        # untrained network should still produce finite values — no NaN/inf
+        # leak from the head, which would silently break training
+        model = AgeEstimator(pretrained=False)
+        x = torch.randn(2, 3, 224, 224)
+        out = model(x)
+        assert torch.isfinite(out).all().item()
+
+    def test_predict_age_shape(self):
+        # predict_age decodes logits to a float age per image
+        model = AgeEstimator(pretrained=False)
+        x = torch.randn(3, 3, 224, 224)
+        ages = model.predict_age(x)
+        assert ages.shape == (3,)
+
+    def test_predict_age_in_valid_range(self):
+        # decoded age must be between 0 and NUM_THRESHOLDS inclusive
+        model = AgeEstimator(pretrained=False)
+        x = torch.randn(4, 3, 224, 224)
+        ages = model.predict_age(x)
+        assert (ages >= 0).all().item()
+        assert (ages <= NUM_THRESHOLDS).all().item()
+
+    def test_backbone_swap_to_identity(self):
+        # ResNet-50's fc must be replaced with Identity so the backbone
+        # outputs the 2048-dim feature vector, not 1000-class logits
+        model = AgeEstimator(pretrained=False)
+        assert isinstance(model.backbone.fc, torch.nn.Identity)
+
+    def test_head_output_dim(self):
+        # final Linear in head must produce NUM_THRESHOLDS outputs
+        model = AgeEstimator(pretrained=False)
+        last_layer = model.head[-1]
+        assert isinstance(last_layer, torch.nn.Linear)
+        assert last_layer.out_features == NUM_THRESHOLDS
+
+    def test_gradients_flow(self):
+        # full backward pass — confirms no detach / no_grad accidentally
+        # left in the path between input and loss
+        model = AgeEstimator(pretrained=False)
+        x = torch.randn(2, 3, 224, 224)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+        # at least one backbone param should have a non-zero gradient
+        any_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in model.backbone.parameters()
+        )
+        assert any_grad
