@@ -60,6 +60,25 @@ class EstimateAgeResponse(BaseModel):
     model_version: str
 
 
+class ExplainResponse(BaseModel):
+    """response shape for POST /explain.
+
+    saliency_map is a 2D list of floats, normalised to [0, 1]. row-major
+    layout, 224x224 to match the model input. consumers (Streamlit,
+    notebook, third-party clients) can render it as a heatmap.
+
+    rationale for nested list of floats vs base64-encoded PNG:
+        keeps the API output JSON-only, no client-side image decoder
+        required. payload is roughly 200 KB at full resolution which is
+        small enough for a real-time UI.
+    """
+    saliency_map: list[list[float]]
+    baseline_age: float = Field(..., ge=0.0, le=100.0)
+    inference_ms: float = Field(..., ge=0.0)
+    grid: int = Field(..., ge=2, le=64)
+    image_size: int = Field(..., ge=32, le=1024)
+
+
 class BiasGroup(BaseModel):
     """one row from the bias report — matches the structure written by Phase 5."""
     group_type: str

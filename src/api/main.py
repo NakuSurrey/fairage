@@ -4,6 +4,7 @@ FastAPI app for FairAge.
 endpoints:
     GET  /health        — quick ok check, used by load balancer + Docker
     POST /estimate-age  — accepts image bytes, returns age + PAD score
+    POST /explain       — accepts image bytes, returns saliency heatmap
     GET  /bias-report   — returns the precomputed bias audit JSON
 
 design choice — eager model loading via the lifespan context manager:
@@ -31,18 +32,22 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
 
-from src.api.inference import InferenceEngine
+from src.api.inference import (
+    DEFAULT_SALIENCY_GRID,
+    DEFAULT_SALIENCY_PATCH_PX,
+    InferenceEngine,
+)
 from src.api.schemas import (
     BiasGroup,
     BiasOverall,
     BiasReportResponse,
     BiasWorstGap,
     EstimateAgeResponse,
+    ExplainResponse,
     HealthResponse,
 )
-from src.config import ARTIFACTS_DIR
+from src.config import ARTIFACTS_DIR, IMAGE_SIZE
 
 # how big a request body the API will accept. images normally arrive
 # under 1 MB after JPEG compression — 10 MB is a generous ceiling that
@@ -117,6 +122,34 @@ def _get_engine(request: Request) -> InferenceEngine:
     return engine
 
 
+async def _read_image_bytes(file: UploadFile) -> bytes:
+    """
+    shared upload validation used by /estimate-age and /explain.
+
+    enforces:
+        - content-type starts with image/
+        - body is non-empty
+        - body is within MAX_UPLOAD_BYTES
+
+    returns the raw bytes ready for engine.predict() or engine.explain().
+    """
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"expected an image upload, got content-type {file.content_type}",
+        )
+
+    body = await file.read()
+    if len(body) == 0:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"upload too large: {len(body)} bytes (max {MAX_UPLOAD_BYTES})",
+        )
+    return body
+
+
 # ---------- /health ----------
 
 
@@ -158,25 +191,7 @@ async def estimate_age(
         4. wrap PredictionResult into a typed response
     """
     engine = _get_engine(request)
-
-    # FastAPI's UploadFile already exposes content_type. quick reject of
-    # obviously wrong inputs before reading the body — saves bandwidth.
-    if file.content_type and not file.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"expected an image upload, got content-type {file.content_type}",
-        )
-
-    # read the body. .read() with no arg returns the full payload —
-    # enforce the size cap manually because UploadFile does not.
-    body = await file.read()
-    if len(body) == 0:
-        raise HTTPException(status_code=400, detail="empty upload")
-    if len(body) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"upload too large: {len(body)} bytes (max {MAX_UPLOAD_BYTES})",
-        )
+    body = await _read_image_bytes(file)
 
     # the engine catches PIL decode errors and surfaces them as ValueError —
     # convert to 400 here so the client sees a clean error message
@@ -197,6 +212,66 @@ async def estimate_age(
                         if result.age_confidence is not None else None),
         inference_ms=result.inference_ms,
         model_version=MODEL_VERSION,
+    )
+
+
+# ---------- /explain ----------
+
+
+@app.post(
+    "/explain",
+    response_model=ExplainResponse,
+    tags=["inference"],
+)
+async def explain(
+    request: Request,
+    file: UploadFile = File(..., description="face image (JPEG/PNG)"),
+    grid: int = DEFAULT_SALIENCY_GRID,
+    patch_px: int = DEFAULT_SALIENCY_PATCH_PX,
+) -> ExplainResponse:
+    """
+    accept a face image, return an occlusion saliency heatmap.
+
+    the heatmap shows which pixel regions most influence the predicted
+    age. opt-in endpoint — the main /estimate-age path stays fast and
+    explanations are computed only when explicitly requested.
+
+    query params:
+        grid     — saliency grid size, 2-64. default 12 (= 144 cells).
+        patch_px — occlusion patch side in pixels, 4-128. default 28.
+
+    response: ExplainResponse with the saliency_map as a nested list
+    of floats normalised to [0, 1]. consumers render as a heatmap.
+    """
+    engine = _get_engine(request)
+
+    # validate query params — pydantic does not validate path/query
+    # ranges automatically the way it does response fields
+    if not (2 <= grid <= 64):
+        raise HTTPException(status_code=400,
+                            detail="grid must be between 2 and 64")
+    if not (4 <= patch_px <= 128):
+        raise HTTPException(status_code=400,
+                            detail="patch_px must be between 4 and 128")
+
+    body = await _read_image_bytes(file)
+
+    try:
+        result = engine.explain(body, grid=grid, patch_px=patch_px)
+    except (ValueError, OSError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"could not decode image: {e}",
+        )
+
+    # convert numpy array to nested list — pydantic does not serialise
+    # numpy arrays directly, but plain lists of floats are JSON-native
+    return ExplainResponse(
+        saliency_map=result.saliency_map.tolist(),
+        baseline_age=round(result.baseline_age, 2),
+        inference_ms=result.inference_ms,
+        grid=grid,
+        image_size=IMAGE_SIZE,
     )
 
 

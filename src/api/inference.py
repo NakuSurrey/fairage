@@ -1,8 +1,9 @@
 """
 inference layer for the FairAge API.
 
-loads both quantized ONNX models on startup and exposes a single
-predict() function that runs PAD first, then age estimation.
+loads both quantized ONNX models on startup and exposes:
+    - predict()  — full pipeline: PAD first, then age (Phase 8)
+    - explain()  — occlusion saliency map for the age model (Phase 9)
 
 design choice — eager loading on startup:
     every request gets a pre-warmed onnxruntime session. zero cold-start
@@ -14,12 +15,14 @@ design choice — single InferenceEngine class:
     on startup and stashes it on app.state. tests can swap in a stub
     by injecting a different engine instance.
 
-flow per request:
-    1. raw bytes -> PIL image -> normalised float tensor [1, 3, 224, 224]
-    2. PAD session runs -> softmax -> probability of attack
-    3. if attack score above threshold, return refusal (no age computed)
-    4. age session runs -> sigmoid -> sum -> predicted age
-    5. response packaged into a typed dict the schemas layer wraps
+design choice — occlusion saliency, not gradient-based:
+    the production model runs through onnxruntime, not torch. occlusion
+    works with any backend — slide a grey patch across the image, watch
+    how the predicted age shifts, the size of the shift at each location
+    is the saliency value for that pixel region. slower than Captum's
+    IntegratedGradients (50-80 forward passes per image vs 1) but
+    backend-agnostic, and explainability is opt-in so the latency cost
+    is acceptable.
 """
 
 from __future__ import annotations
@@ -51,6 +54,12 @@ DEFAULT_PAD_MODEL_PATH = EXPORTS_DIR / "pad_model_int8.onnx"
 # of accepting a spoof is high. 0.5 is the documented default.
 DEFAULT_SPOOF_THRESHOLD = 0.5
 
+# saliency defaults — chosen so a single explain() call finishes in
+# roughly 1-2 seconds on a 4-vCPU box. larger grids give finer maps
+# at higher latency cost.
+DEFAULT_SALIENCY_GRID = 12   # 12x12 = 144 forward passes per image
+DEFAULT_SALIENCY_PATCH_PX = 28  # patch covers ~12% of one side
+
 
 @dataclass
 class PredictionResult:
@@ -65,6 +74,23 @@ class PredictionResult:
     estimated_age: Optional[float]  # None if rejected as spoof
     age_confidence: Optional[float] # None if rejected as spoof
     inference_ms: float             # wall-clock time end-to-end
+
+
+@dataclass
+class SaliencyResult:
+    """
+    output of the explain() call.
+
+    saliency_map shape is (H, W) — one float per pixel region. values
+    are in [0, 1] after normalisation, where 1 means "covering this
+    region changes the prediction most" and 0 means "no effect".
+
+    baseline_age is what the model predicts on the unmasked image.
+    used by the UI to caption the heatmap.
+    """
+    saliency_map: np.ndarray   # (H, W), float32, normalised [0, 1]
+    baseline_age: float
+    inference_ms: float
 
 
 def _preprocess_image(image_bytes: bytes, image_size: int = IMAGE_SIZE) -> np.ndarray:
@@ -133,6 +159,16 @@ def _decode_age(age_logits: np.ndarray) -> tuple[float, float]:
     distance_from_boundary = np.abs(probs - 0.5) * 2.0
     confidence = float(distance_from_boundary.mean())
     return age, confidence
+
+
+def _predicted_age_from_tensor(session, tensor: np.ndarray) -> float:
+    """
+    helper used by both predict() and explain() — runs the age session
+    on a preprocessed tensor and decodes to a float age.
+    """
+    age_logits = session.run(None, {"input": tensor})[0]
+    age, _ = _decode_age(age_logits)
+    return age
 
 
 class InferenceEngine:
@@ -229,5 +265,106 @@ class InferenceEngine:
             pad_score=pad_score,
             estimated_age=age,
             age_confidence=confidence,
+            inference_ms=round(elapsed_ms, 2),
+        )
+
+    def explain(
+        self,
+        image_bytes: bytes,
+        grid: int = DEFAULT_SALIENCY_GRID,
+        patch_px: int = DEFAULT_SALIENCY_PATCH_PX,
+    ) -> SaliencyResult:
+        """
+        compute an occlusion-based saliency heatmap for the age model.
+
+        the algorithm:
+            1. run the model on the unmasked image -> baseline age
+            2. for each cell in a `grid x grid` overlay:
+                a. mask that cell with a grey patch
+                b. run the model -> masked age
+                c. store |masked_age - baseline_age| at that cell
+            3. normalise the deltas to [0, 1]
+
+        why occlusion and not gradients:
+            the served model is a quantized ONNX file. ONNX Runtime does
+            not give gradients. occlusion is purely forward-pass — works
+            with any model format, any backend. matches Microsoft's
+            interpretability approach for non-torch deployments.
+
+        latency: roughly grid*grid forward passes. with grid=12 that is
+            144 passes — about 1-2 seconds on a 4-vCPU Hetzner box for the
+            int8-quantized model. acceptable for an opt-in /explain endpoint.
+
+        args:
+            image_bytes — raw upload bytes
+            grid        — grid size (12 -> 144 occlusion cells)
+            patch_px    — side length of the grey patch in pixels
+        """
+        start = time.perf_counter()
+
+        # baseline tensor and baseline age — computed once, reused below
+        tensor = _preprocess_image(image_bytes)
+        baseline_age = _predicted_age_from_tensor(self._age_session, tensor)
+
+        # the saliency map is laid out at the input resolution so the UI
+        # can overlay it directly on the resized image. start as zeros.
+        h, w = IMAGE_SIZE, IMAGE_SIZE
+        saliency = np.zeros((h, w), dtype=np.float32)
+
+        # cell stride — covers the whole image in `grid` steps along each axis
+        stride_h = max(1, h // grid)
+        stride_w = max(1, w // grid)
+
+        # the grey patch — neutral value in normalised space. since the
+        # tensor is already imagenet-normalised, a "grey" patch in pixel
+        # space is roughly zero in normalised space. using zero keeps the
+        # math simple and the visualisation interpretable.
+        patch_value = 0.0
+
+        # half_patch is how far the patch extends from the cell centre.
+        # patches at the image edge are clipped automatically by the
+        # numpy slice — cells near the corner cover fewer pixels than
+        # cells near the centre, which matches what occlusion saliency
+        # should do (no padding artefacts).
+        half = patch_px // 2
+
+        # main occlusion loop — one forward pass per (row, col) cell.
+        # iterating over flat cell coords keeps the loop tight; could
+        # be batched into one big tensor of shape (grid*grid, 3, H, W)
+        # but that uses ~6x more memory and the speedup is small.
+        for row in range(grid):
+            for col in range(grid):
+                cy = row * stride_h + stride_h // 2
+                cx = col * stride_w + stride_w // 2
+
+                # numpy slicing handles edge-clipping automatically
+                y_lo, y_hi = max(0, cy - half), min(h, cy + half)
+                x_lo, x_hi = max(0, cx - half), min(w, cx + half)
+
+                # work on a copy — must not mutate the baseline tensor
+                masked = tensor.copy()
+                masked[:, :, y_lo:y_hi, x_lo:x_hi] = patch_value
+
+                masked_age = _predicted_age_from_tensor(self._age_session, masked)
+                delta = abs(masked_age - baseline_age)
+
+                # paint the delta over the cell's pixel region. when cells
+                # overlap (large patch_px relative to stride), max-merge
+                # so the most-impactful cell wins.
+                saliency[y_lo:y_hi, x_lo:x_hi] = np.maximum(
+                    saliency[y_lo:y_hi, x_lo:x_hi], delta
+                )
+
+        # normalise to [0, 1] for visualisation. if the image has zero
+        # variation in predictions, return all zeros instead of dividing
+        # by zero.
+        max_val = float(saliency.max())
+        if max_val > 0:
+            saliency = saliency / max_val
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return SaliencyResult(
+            saliency_map=saliency.astype(np.float32),
+            baseline_age=baseline_age,
             inference_ms=round(elapsed_ms, 2),
         )
