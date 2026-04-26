@@ -1,0 +1,32 @@
+# training-only deps — installed on Surrey HPC and laptop dev env, NEVER in API container
+# install on top of requirements.txt:  pip install -r requirements-train.txt
+
+# deep learning core — pinned to CUDA 12.1 build, matches Surrey cluster module
+torch==2.4.1
+torchvision==0.19.1
+
+# experiment tracking
+wandb==0.18.1
+
+# notebooks for EDA
+jupyter==1.1.1
+ipykernel==6.29.5
+matplotlib==3.9.2
+seaborn==0.13.2
+pandas==2.2.3
+scikit-learn==1.5.2
+tqdm==4.66.5
+
+# saliency maps — Captum, built by the PyTorch team
+captum==0.7.0
+
+# onnx export path — torch -> onnx -> tflite
+onnx==1.16.2
+onnxruntime==1.19.2
+
+# tflite conversion — needs full tensorflow, only on training machines
+tensorflow==2.16.1
+
+# testing
+pytest==8.3.3
+pytest-cov==5.0.0

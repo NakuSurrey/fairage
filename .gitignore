@@ -1,0 +1,75 @@
+# python build + cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# virtualenvs — local only, never tracked
+venv/
+.venv/
+env/
+ENV/
+
+# editor + os junk
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# onedrive lock files — happens when files are still syncing
+~$*
+*.lock
+
+# secrets — never tracked, .env.example holds placeholders
+.env
+.env.*
+!.env.example
+
+# datasets — too large for git, downloaded per data/README.md
+data/utkface/
+data/fairface/
+data/pad/
+data/raw/
+data/processed/
+*.zip
+*.tar
+*.tar.gz
+
+# model weights + checkpoints — not in git, transferred via scp
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.h5
+artifacts/checkpoints/
+artifacts/exports/
+
+# notebook outputs — keep notebooks but strip outputs before commit
+*.ipynb_checkpoints/
+
+# wandb local run logs
+wandb/
+
+# slurm job logs — generated on cluster, not source
+slurm-*.out
+*.err
+*.log
+
+# docs folder — local-only reference notes per Rule B5
+docs/
+
+# coverage reports
+.coverage
+htmlcov/
+coverage.xml

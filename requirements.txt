@@ -1,0 +1,29 @@
+# API runtime deps — kept minimal so the Docker image stays small
+# torch and training tools live in requirements-train.txt — never installed in production
+
+# web server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# data validation
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# inference — TFLite runtime only, NOT the full TensorFlow package
+tflite-runtime==2.14.0 ; platform_machine != "x86_64" or sys_platform != "win32"
+# windows fallback — full tensorflow only when tflite-runtime wheel missing
+tensorflow-cpu==2.16.1 ; sys_platform == "win32"
+
+# image handling
+pillow==10.4.0
+numpy==1.26.4
+
+# streamlit demo
+streamlit==1.39.0
+requests==2.32.3
+
+# env loading
+python-dotenv==1.0.1
+
+# multipart for file uploads on FastAPI
+python-multipart==0.0.10

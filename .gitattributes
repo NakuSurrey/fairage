@@ -1,0 +1,28 @@
+# default — let git auto-detect text vs binary
+* text=auto
+
+# force LF on anything that runs on linux servers
+# Windows CRLF would break shell scripts on Hetzner and Surrey HPC
+*.sh         text eol=lf
+*.bash       text eol=lf
+Dockerfile   text eol=lf
+*.dockerfile text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.conf       text eol=lf
+
+# python source — keep LF for cross-platform safety
+*.py text eol=lf
+
+# treat these as binary — never line-end normalise
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pt  binary
+*.pth binary
+*.onnx binary
+*.tflite binary
+*.h5 binary
+*.zip binary
+*.tar binary
+*.tar.gz binary
