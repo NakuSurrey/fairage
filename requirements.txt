@@ -9,10 +9,10 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 pydantic-settings==2.5.2
 
-# inference — tflite-runtime is linux-only (Hetzner serves the model on linux)
-# windows laptops use tensorflow-cpu, which includes the same TFLite interpreter
-tflite-runtime==2.14.0 ; sys_platform == "linux"
-tensorflow-cpu==2.16.1 ; sys_platform == "win32" or sys_platform == "darwin"
+# inference — ONNX Runtime serves the int8-quantized age model on CPU
+# Phase 7 chose ONNX Runtime over TFLite. ORT is the production-standard
+# inference engine (Microsoft) and is faster on server-grade x86 CPUs.
+onnxruntime==1.19.2
 
 # image handling
 pillow==10.4.0

@@ -1,0 +1,116 @@
+"""
+quantize the exported ONNX model to INT8.
+
+quantization replaces every float32 weight with an int8 approximation.
+this gives:
+    - smaller model file (~4x smaller — float32 is 4 bytes, int8 is 1 byte)
+    - faster CPU inference (int8 ops use vectorized CPU instructions)
+    - tiny accuracy drop (typically under 1% for a well-trained model)
+
+we use DYNAMIC quantization, not static:
+
+    dynamic — quantize weights ahead of time, quantize activations on the
+              fly during inference. no calibration data needed.
+
+    static  — quantize weights AND activations ahead of time. needs a
+              calibration dataset to figure out activation ranges. faster
+              at runtime but more complex pipeline.
+
+dynamic is the right choice here:
+    - the project goal is sub-200ms CPU latency, not absolute peak speed
+    - dynamic quantization gives most of the speedup with none of the
+      calibration setup. saves a phase of work.
+    - matches what most production deployments actually do for transformer
+      and CNN models served via onnxruntime
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# repo root on sys.path so `src.*` imports work
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.config import EXPORTS_DIR
+
+
+def quantize_onnx_model(
+    fp32_path: Path,
+    int8_path: Path,
+) -> dict:
+    """
+    convert a float32 ONNX model into an INT8 quantized ONNX model.
+
+    args:
+        fp32_path — input float32 ONNX file (from export_onnx.py)
+        int8_path — where to save the int8 quantized file
+
+    returns dict with file size info — used by the benchmark step and the
+    README to show the size reduction.
+    """
+    try:
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+    except ImportError as e:
+        raise RuntimeError(
+            "onnxruntime quantization tools are required. "
+            "install with: pip install onnxruntime"
+        ) from e
+
+    int8_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # quantize_dynamic does the work. weight_type=QInt8 is the standard
+    # signed 8-bit choice — same precision as TFLite int8 quantization.
+    # per_channel=False keeps the model simpler and most CNN ops run
+    # faster with per-tensor quantization on CPU.
+    quantize_dynamic(
+        model_input=str(fp32_path),
+        model_output=str(int8_path),
+        weight_type=QuantType.QInt8,
+        per_channel=False,
+    )
+
+    # report file sizes — useful as a sanity check and a README number
+    fp32_mb = fp32_path.stat().st_size / (1024 * 1024)
+    int8_mb = int8_path.stat().st_size / (1024 * 1024)
+    reduction = (1 - int8_mb / fp32_mb) * 100 if fp32_mb > 0 else 0.0
+
+    info = {
+        "fp32_path": str(fp32_path),
+        "int8_path": str(int8_path),
+        "fp32_size_mb": round(fp32_mb, 2),
+        "int8_size_mb": round(int8_mb, 2),
+        "size_reduction_pct": round(reduction, 1),
+    }
+
+    print(f"fp32: {fp32_mb:.1f} MB -> int8: {int8_mb:.1f} MB "
+          f"({reduction:.0f}% smaller)")
+    return info
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fp32",
+        type=str,
+        default=str(EXPORTS_DIR / "age_model.onnx"),
+        help="path to the float32 ONNX file produced by export_onnx.py",
+    )
+    parser.add_argument(
+        "--int8",
+        type=str,
+        default=str(EXPORTS_DIR / "age_model_int8.onnx"),
+        help="where to save the INT8 quantized ONNX file",
+    )
+    args = parser.parse_args()
+
+    quantize_onnx_model(
+        fp32_path=Path(args.fp32),
+        int8_path=Path(args.int8),
+    )
+
+
+if __name__ == "__main__":
+    main()
