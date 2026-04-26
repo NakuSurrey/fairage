@@ -1,0 +1,65 @@
+# keep the Docker build context small. anything matching here is NOT
+# sent to the daemon when running `docker build`. faster builds, smaller
+# layers, and no chance of accidentally baking secrets into the image.
+
+# python build artifacts
+__pycache__
+*.py[cod]
+*.pyo
+*.egg-info
+.eggs
+
+# virtualenvs — never ship a host venv inside a container
+venv
+.venv
+env
+ENV
+
+# git metadata — image does not need .git history
+.git
+.gitignore
+.gitattributes
+
+# tests, notebooks, training-only code — not part of the API runtime
+tests
+notebooks
+slurm
+deploy
+streamlit_app
+
+# data and large binaries — too big for the image, mounted at runtime instead
+data
+artifacts
+*.pt
+*.pth
+*.onnx
+*.ckpt
+wandb
+slurm-*.out
+*.err
+*.log
+
+# editor + os junk
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# secrets — the .env file never ships in the image
+.env
+.env.*
+!.env.example
+
+# docs folder — local-only reference notes
+docs
+
+# pytest + coverage cache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+coverage.xml
+
+# training-side requirements never installed in the API image
+requirements-train.txt
