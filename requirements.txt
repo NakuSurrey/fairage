@@ -9,10 +9,10 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 pydantic-settings==2.5.2
 
-# inference — TFLite runtime only, NOT the full TensorFlow package
-tflite-runtime==2.14.0 ; platform_machine != "x86_64" or sys_platform != "win32"
-# windows fallback — full tensorflow only when tflite-runtime wheel missing
-tensorflow-cpu==2.16.1 ; sys_platform == "win32"
+# inference — tflite-runtime is linux-only (Hetzner serves the model on linux)
+# windows laptops use tensorflow-cpu, which includes the same TFLite interpreter
+tflite-runtime==2.14.0 ; sys_platform == "linux"
+tensorflow-cpu==2.16.1 ; sys_platform == "win32" or sys_platform == "darwin"
 
 # image handling
 pillow==10.4.0

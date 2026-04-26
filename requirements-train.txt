@@ -24,8 +24,8 @@ captum==0.7.0
 onnx==1.16.2
 onnxruntime==1.19.2
 
-# tflite conversion — needs full tensorflow, only on training machines
-tensorflow==2.16.1
+# tflite conversion uses the tensorflow package — already pinned in requirements.txt
+# (tensorflow-cpu on windows/macos, tflite-runtime on linux). do not duplicate here.
 
 # testing
 pytest==8.3.3
