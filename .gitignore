@@ -73,3 +73,9 @@ docs/
 .coverage
 htmlcov/
 coverage.xml
+
+# stub helper — only needed before HPC training, never committed
+bootstrap_stub_checkpoints.py
+
+# benchmark results — committed only after HPC training, stub numbers are not real
+artifacts/benchmark_results.json
