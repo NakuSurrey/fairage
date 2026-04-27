@@ -1,0 +1,99 @@
+# Docker Compose for FairAge — runs API + Streamlit demo on Hetzner.
+#
+# security pattern carries forward the NHS-incident lessons:
+#   - 127.0.0.1 port binding (NOT 0.0.0.0). nginx fronts both services
+#     on port 80 and forwards internally. nothing on 8003/8503 is
+#     reachable from the public internet directly.
+#   - restart: on-failure:3 instead of `always` or `unless-stopped`.
+#     `always` force-multiplies malware: kills container -> restart ->
+#     re-exec -> repeat. `on-failure:3` lets the operator notice.
+#   - resource limits on every service. caps blast radius if any
+#     container is compromised — a miner cannot eat 100% of the box.
+#   - tmpfs /tmp with noexec,nosuid. blocks the /tmp/<binary>
+#     execution pattern the cryptominer used on nhs-db.
+#   - read_only: true on the API container — model files are mounted
+#     read-only, no writable paths inside the container apart from
+#     the explicit tmpfs.
+#
+# usage on Hetzner (full sequence in deploy/README.md):
+#     ssh root@<hetzner-host>
+#     cd ~/fairage
+#     git pull origin main
+#     docker compose -f deploy/docker-compose.yml up -d --build
+
+services:
+  fairage-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: fairage-api:latest
+    container_name: fairage-api
+    restart: on-failure:3
+    # 127.0.0.1 binding — accessible only from the host. nginx forwards.
+    ports:
+      - "127.0.0.1:8003:8003"
+    environment:
+      - MODEL_VERSION=${MODEL_VERSION:-fairage-1.0}
+    # mount the trained ONNX models read-only. checkpoints come from
+    # surrey HPC -> laptop -> hetzner via scp; the docker image stays
+    # model-free and small.
+    volumes:
+      - ../artifacts/exports:/app/artifacts/exports:ro
+      - ../artifacts/bias_report.json:/app/artifacts/bias_report.json:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64M
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - fairage-internal
+
+  fairage-demo:
+    build:
+      context: ..
+      dockerfile: streamlit_app/Dockerfile
+    image: fairage-demo:latest
+    container_name: fairage-demo
+    restart: on-failure:3
+    # 127.0.0.1 binding — same defense-in-depth as the API
+    ports:
+      - "127.0.0.1:8503:8503"
+    environment:
+      # API URL points at the API container by service name on the
+      # internal docker network — does not need to leave the host
+      - FAIRAGE_API_URL=http://fairage-api:8003
+    depends_on:
+      fairage-api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64M
+    healthcheck:
+      # Streamlit's /_stcore/health is the official liveness probe
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8503/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - fairage-internal
+
+# isolated network — nothing else on the host can reach these services
+# except via the explicit port mappings above (which are localhost-only).
+networks:
+  fairage-internal:
+    driver: bridge
