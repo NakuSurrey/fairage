@@ -9,8 +9,11 @@ Bias-audited age estimation with presentation attack detection. Trained on UTKFa
 [![Tests](https://img.shields.io/badge/tests-118_passing-brightgreen.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> **Live demo:** _coming after first deploy — URL pinned here_
-> **API docs:** _same — `/fairage-api/docs` once live_
+> **Live demo:** http://46.225.208.197/fairage-demo/
+> **API docs:** http://46.225.208.197/fairage-api/docs
+> **Health:** http://46.225.208.197/fairage-api/health
+>
+> _Hosted on a 4 vCPU Hetzner box with stub-trained models — predictions are not real ages yet. The serving stack, ONNX pipeline, and bias-audit endpoints all work end-to-end. Real models land after the Surrey HPC training run._
 
 ## What it does
 
@@ -100,7 +103,7 @@ docs/             — ARCHITECTURE.md, DECISIONS.md, ACCS_NOTES.md
 
 ## Performance
 
-- **Overall test MAE:** _filled in after first full training run_
+- **Overall test MAE:** _stub models in production right now — real MAE published after the Surrey HPC training run_
 - **Inference latency:** sub-200ms p99 on a 4-vCPU CPU (int8 quantized model)
 - **Model size:** ~25 MB int8 (down from ~95 MB float32)
 - **Bias audit:** see [artifacts/bias_report.md](artifacts/bias_report.md) for the full per-group breakdown
