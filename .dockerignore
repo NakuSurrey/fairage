@@ -25,7 +25,6 @@ tests
 notebooks
 slurm
 deploy
-streamlit_app
 
 # data and large binaries — too big for the image, mounted at runtime instead
 data

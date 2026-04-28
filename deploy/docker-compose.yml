@@ -34,6 +34,9 @@ services:
       - "127.0.0.1:8003:8003"
     environment:
       - MODEL_VERSION=${MODEL_VERSION:-fairage-1.0}
+      # tells FastAPI it is mounted at /fairage-api behind nginx,
+      # so the docs page emits the correct openapi.json URL
+      - FAIRAGE_ROOT_PATH=/fairage-api
     # mount the trained ONNX models read-only. checkpoints come from
     # surrey HPC -> laptop -> hetzner via scp; the docker image stays
     # model-free and small.
@@ -84,7 +87,7 @@ services:
     healthcheck:
       # Streamlit's /_stcore/health is the official liveness probe
       test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8503/_stcore/health')"]
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8503/fairage-demo/_stcore/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

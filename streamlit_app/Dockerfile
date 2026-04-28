@@ -54,7 +54,7 @@ EXPOSE 8503
 
 # Streamlit's healthcheck endpoint at /_stcore/health
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8503/_stcore/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8503/fairage-demo/_stcore/health')" || exit 1
 
 # server.address 0.0.0.0 lets the container accept traffic from the
 # docker bridge. the port is still bound to 127.0.0.1 on the host

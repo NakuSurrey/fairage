@@ -99,11 +99,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = None
 
 
+# root_path tells FastAPI it is mounted behind a path prefix at the
+# reverse proxy. when set, the docs page rewrites /openapi.json to
+# <root_path>/openapi.json so Swagger UI loads correctly through nginx.
+# empty string (default) keeps local dev working as before.
+ROOT_PATH = os.getenv("FAIRAGE_ROOT_PATH", "")
+
 app = FastAPI(
     title="FairAge",
     description="Bias-audited age estimation with presentation attack detection",
     version=MODEL_VERSION,
     lifespan=lifespan,
+    root_path=ROOT_PATH,
 )
 
 
